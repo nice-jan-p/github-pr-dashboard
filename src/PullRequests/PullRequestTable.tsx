@@ -153,6 +153,17 @@ export default function PullRequestTable(props: PullRequestTableProps) {
       <DataGrid
         rows={filteredRows}
         columns={columns}
+        getRowClassName={params => (params.row._removing ? 'pr-row--removing' : '')}
+        sx={{
+          '@keyframes prRowFadeOut': {
+            from: { opacity: 1 },
+            to: { opacity: 0 },
+          },
+          '& .pr-row--removing': {
+            animation: 'prRowFadeOut 600ms ease forwards',
+            pointerEvents: 'none',
+          },
+        }}
         hideFooter
         autoHeight
         disableSelectionOnClick

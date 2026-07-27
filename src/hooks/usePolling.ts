@@ -3,8 +3,12 @@ import { fetchPullRequests } from '../PullRequests/fetchPullRequests'
 import { isPollingPaused } from '../GitHub/Api'
 import { loadSeenPrKeys, saveSeenPrKeys, makePrKey } from '../notifications/seenPrStore'
 import { showPrNotification } from '../notifications/notificationService'
+import { reconcileRows } from '../PullRequests/reconcileRows'
 
 const POLL_INTERVAL_MS = 60_000
+// Keep a PR that disappeared from the results visible briefly so it can fade out
+// before being removed. Must match the animation duration in PullRequestTable.
+const FADE_OUT_MS = 600
 
 interface UsePollingResult {
   rows: any[]
@@ -24,9 +28,59 @@ export function usePolling(filters: string): UsePollingResult {
   const isFirstFetchRef = useRef(true)
   const filtersRef = useRef(filters)
   const isFetchingRef = useRef(false)
+  // Mirror of the currently-displayed rows (incl. rows mid-fade-out) so poll()
+  // can diff against them without depending on React state closures.
+  const rowsRef = useRef<any[]>([])
+  // Pending fade-out timers keyed by PR, so we can cancel a removal if the PR
+  // reappears before its timer fires.
+  const removalTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
 
   // Keep filtersRef in sync
   filtersRef.current = filters
+
+  // Replace the displayed rows with the freshly fetched ones, but keep any PR that
+  // vanished from the results on screen for a short moment (flagged `_removing`)
+  // so the table can fade it out before it's actually dropped.
+  const reconcileDisplayedRows = useCallback((fetchedRows: any[], isFilterChange: boolean) => {
+    // A filter change swaps the whole set — replace immediately, no fade-outs.
+    if (isFilterChange) {
+      removalTimersRef.current.forEach(timer => clearTimeout(timer))
+      removalTimersRef.current.clear()
+      rowsRef.current = fetchedRows
+      setRows(fetchedRows)
+      return
+    }
+
+    const { rows: merged, removingKeys } = reconcileRows(rowsRef.current, fetchedRows)
+    const removingKeySet = new Set(removingKeys)
+
+    // Cancel fade-outs for PRs no longer removing (reappeared, or already dropped).
+    removalTimersRef.current.forEach((timer, key) => {
+      if (!removingKeySet.has(key)) {
+        clearTimeout(timer)
+        removalTimersRef.current.delete(key)
+      }
+    })
+
+    // Schedule the actual removal for newly-disappeared PRs once the fade has played.
+    removingKeys.forEach(key => {
+      if (removalTimersRef.current.has(key)) return
+      const timer = setTimeout(() => {
+        removalTimersRef.current.delete(key)
+        setRows(current => {
+          const next = current.filter(
+            (r: any) => makePrKey(r.repository, r.number) !== key
+          )
+          rowsRef.current = next
+          return next
+        })
+      }, FADE_OUT_MS)
+      removalTimersRef.current.set(key, timer)
+    })
+
+    rowsRef.current = merged
+    setRows(merged)
+  }, [])
 
   const poll = useCallback(async (isFilterChange: boolean) => {
     if (isFetchingRef.current) return
@@ -46,8 +100,8 @@ export function usePolling(filters: string): UsePollingResult {
       if (fetchedRows === null) return
 
       setError(null)
-      setRows(fetchedRows)
       setLastPollTime(new Date())
+      reconcileDisplayedRows(fetchedRows, isFilterChange)
 
       // Build set of fetched PR keys
       const fetchedKeys = new Set(
@@ -95,7 +149,7 @@ export function usePolling(filters: string): UsePollingResult {
       setIsLoading(false)
       isFetchingRef.current = false
     }
-  }, [])
+  }, [reconcileDisplayedRows])
 
   // Start/restart polling when filters change
   useEffect(() => {
@@ -129,6 +183,15 @@ export function usePolling(filters: string): UsePollingResult {
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
   }, [poll])
+
+  // Clear any pending fade-out timers on unmount
+  useEffect(() => {
+    const timers = removalTimersRef.current
+    return () => {
+      timers.forEach(timer => clearTimeout(timer))
+      timers.clear()
+    }
+  }, [])
 
   return { rows, isLoading, lastPollTime, error }
 }
